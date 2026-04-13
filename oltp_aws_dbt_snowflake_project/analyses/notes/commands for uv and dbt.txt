@@ -1,0 +1,18 @@
+Hey! Here is a quick breakdown of the commands we used to get everything running with uv and dbt.
+
+### 1. Install uv
+First, we need the uv package manager. It's super fast for managing Python environments.
+> pip install uv
+
+### 2. Set up the Virtual Env & Install dbt
+Now, create a environment and install dbt along with the Snowflake connector.
+> uv venv
+> uv pip install dbt-snowflake
+
+### 3. Initialize your dbt Project
+Once dbt is installed, you can start a new project like this:
+> dbt init your_project_name
+
+### Quick tip:
+To hop back into your environment next time you open the terminal, just run:
+> .venv\Scripts\activate
