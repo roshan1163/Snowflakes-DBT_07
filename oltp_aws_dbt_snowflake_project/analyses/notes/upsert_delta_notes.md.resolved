@@ -1,0 +1,224 @@
+# Upsert vs Delta Load — Complete Notes (dbt + Snowflake)
+
+---
+
+## 1. What is a Delta Load?
+
+A Delta Load means: "Only fetch and process records that are NEW since the last run."
+
+It does NOT handle records that were already inserted but later got updated.
+
+### How it works:
+- On the first run, all records are loaded into the target table.
+- On every subsequent run, only records with a timestamp greater than the maximum timestamp already in the target table are fetched.
+- This makes subsequent runs very fast because only a small number of rows are processed.
+
+### Example:
+
+Target table (silver_bookings) after Day 1:
+
+  BOOKING_ID | STATUS    | CREATED_AT
+  -----------|-----------|------------
+  B001       | confirmed | Jan 1
+  B002       | confirmed | Jan 2
+  B003       | confirmed | Jan 3
+
+Source data on Day 2:
+
+  BOOKING_ID | STATUS    | CREATED_AT
+  -----------|-----------|------------
+  B001       | cancelled | Jan 1   (status changed, same date)
+  B004       | confirmed | Jan 4   (new row)
+
+Delta filter: WHERE CREATED_AT > Jan 3
+
+Only B004 is fetched. B001 status change is MISSED.
+
+Result after Day 2:
+
+  BOOKING_ID | STATUS    | CREATED_AT
+  -----------|-----------|------------
+  B001       | confirmed | Jan 1   (WRONG — change missed)
+  B002       | confirmed | Jan 2
+  B003       | confirmed | Jan 3
+  B004       | confirmed | Jan 4   (added correctly)
+
+Conclusion: Delta load using CREATED_AT is only safe for append-only data (e.g., logs, events, transactions that never get updated).
+
+---
+
+## 2. What is an Upsert?
+
+Upsert = UPDATE + INSERT combined.
+
+It means: "If a record already exists, update it. If it is new, insert it."
+
+### How it works:
+- All rows (or a filtered subset) are fetched from the source.
+- A MERGE statement is used to compare source and target using a unique key (e.g., BOOKING_ID).
+- If the key already exists in the target >> UPDATE the row.
+- If the key does not exist in the target >> INSERT the row.
+
+### Example:
+
+Target table (silver_bookings) after Day 1:
+
+  BOOKING_ID | STATUS    | UPDATED_AT
+  -----------|-----------|------------
+  B001       | confirmed | Jan 1
+  B002       | confirmed | Jan 2
+  B003       | confirmed | Jan 3
+
+Source data on Day 2:
+
+  BOOKING_ID | STATUS    | UPDATED_AT
+  -----------|-----------|------------
+  B001       | cancelled | Jan 4   (status changed)
+  B004       | confirmed | Jan 4   (new row)
+
+Upsert logic (MERGE):
+- B001 already exists in target >> UPDATE status to 'cancelled'
+- B004 does not exist in target >> INSERT new row
+
+Result after Day 2:
+
+  BOOKING_ID | STATUS    | UPDATED_AT
+  -----------|-----------|------------
+  B001       | cancelled | Jan 4   (UPDATED correctly)
+  B002       | confirmed | Jan 2
+  B003       | confirmed | Jan 3
+  B004       | confirmed | Jan 4   (INSERTED correctly)
+
+Conclusion: Upsert handles both new and changed records correctly. Drawback: Without a filter, it reads ALL rows from source every time, which is slow for large datasets.
+
+---
+
+## 3. Handling Both — Delta + Upsert Together
+
+The best approach combines:
+  - UPDATED_AT filter  >>  Delta (only fetch new or changed rows)
+  - unique_key config  >>  Upsert (merge/update on existing rows)
+
+This gives the speed of delta AND the correctness of upsert.
+
+### dbt Code Pattern:
+
+{{ config(
+    materialized="incremental",
+    unique_key='BOOKING_ID'
+) }}
+
+select
+    BOOKING_ID,
+    LISTING_ID,
+    BOOKING_STATUS,
+    BOOKING_AMOUNT,
+    CREATED_AT,
+    UPDATED_AT
+from {{ ref('bronze_bookings') }}
+
+{% if is_incremental() %}
+  where UPDATED_AT > (select max(UPDATED_AT) from {{ this }})
+{% endif %}
+
+### Key: Use UPDATED_AT, not CREATED_AT
+
+  - CREATED_AT >> only changes when a row is first inserted
+  - UPDATED_AT >> changes every time a row is updated in the source system
+
+By filtering on UPDATED_AT, you catch both new rows AND modified rows.
+
+---
+
+## 4. Case Study — Full Walkthrough
+
+Scenario: A booking platform where bookings can be created and later cancelled or modified.
+
+### Day 1 — First Run (Full Load)
+
+Source has 3 bookings. Table does not exist yet in Snowflake.
+dbt creates the table and inserts all 3 rows.
+
+  silver_bookings:
+  BOOKING_ID | STATUS    | UPDATED_AT
+  -----------|-----------|------------
+  B001       | confirmed | Jan 1
+  B002       | confirmed | Jan 2
+  B003       | confirmed | Jan 3
+
+max(UPDATED_AT) in target = Jan 3
+
+---
+
+### Day 2 — Incremental Run
+
+Overnight changes in source:
+  - B001: status changed to 'cancelled' >> UPDATED_AT = Jan 4
+  - B004: new booking >> UPDATED_AT = Jan 4
+
+Delta filter fetches: WHERE UPDATED_AT > Jan 3
+
+Rows fetched from source:
+
+  BOOKING_ID | STATUS    | UPDATED_AT
+  -----------|-----------|------------
+  B001       | cancelled | Jan 4
+  B004       | confirmed | Jan 4
+
+dbt runs a MERGE in Snowflake:
+  - B001 exists in target >> UPDATE status to 'cancelled'
+  - B004 does not exist  >> INSERT new row
+
+Final silver_bookings after Day 2:
+
+  BOOKING_ID | STATUS    | UPDATED_AT
+  -----------|-----------|------------
+  B001       | cancelled | Jan 4   (updated)
+  B002       | confirmed | Jan 2
+  B003       | confirmed | Jan 3
+  B004       | confirmed | Jan 4   (inserted)
+
+Result: Only 2 rows were read from source. The table is correct and up to date.
+
+---
+
+## 5. Comparison Table
+
+  Approach              | New Rows | Updated Rows | Rows Processed   | Performance
+  ----------------------|----------|--------------|------------------|-------------
+  Delta (CREATED_AT)    | Yes      | No           | Only new rows    | Fast
+  Upsert (no filter)    | Yes      | Yes          | All rows         | Slow
+  Delta + Upsert        | Yes      | Yes          | Only new/changed | Fast (Best)
+
+---
+
+## 6. What if UPDATED_AT does not exist in the source?
+
+Use a lookback window. This fetches rows from the last few days to catch late-arriving updates.
+
+{% if is_incremental() %}
+  where CREATED_AT > (
+      select dateadd(day, -3, max(CREATED_AT))
+      from {{ this }}
+  )
+{% endif %}
+
+This goes 3 days back from the latest record in the target, acting as a safety net for updates that arrive late.
+
+---
+
+## 7. Three Requirements for Delta + Upsert to Work
+
+  1. Source table must have an UPDATED_AT column that gets updated every time a record changes.
+  2. unique_key must be set in dbt config so dbt knows which column to match on during the merge.
+  3. The source system must reliably update the UPDATED_AT timestamp on every change.
+
+---
+
+## Summary
+
+  - Delta Load alone: Fast, but misses updates to existing rows.
+  - Upsert alone: Correct, but slow (reads everything).
+  - Delta + Upsert: Best of both. Filter by UPDATED_AT to limit rows fetched, and use unique_key to merge correctly into the target table.
+
+This is the recommended pattern for Silver layer models in a Medallion Architecture with dbt and Snowflake.

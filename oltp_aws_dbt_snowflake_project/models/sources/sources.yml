@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: stagging
+    database: snowflake7  
+    schema: stagging  
+    tables:
+      - name: bookings
+      - name: hosts
+      - name: listings
